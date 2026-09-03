@@ -27,6 +27,11 @@ on:
         required: false
         default: true
         type: boolean
+      retry_attempt:
+        description: "Internal retry marker"
+        required: false
+        default: "0"
+        type: string
   # Draw data is refreshed around 21:40 China time; cron expressions use UTC.
   schedule:
     - cron: "0 14 * * *"
@@ -35,7 +40,7 @@ on:
     - cron: "7,22,37,52 * * * *"
 
 permissions:
-  actions: read
+  actions: write
   contents: write
   id-token: write
 
@@ -190,6 +195,24 @@ jobs:
       - name: Publish V6 data to smart ledger
         shell: pwsh
         run: |
+          function Invoke-RequiredPublish {
+            param([string]$Url, [hashtable]$Headers, [string]$Body)
+            $lastError = $null
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                $response = Invoke-RestMethod -Method Post -Uri $Url -Headers $Headers -ContentType 'application/json' -Body $Body -ErrorAction Stop
+                if ($null -ne $response.status -and $response.status -ne 'success') {
+                  throw "发布接口返回异常状态：$($response.status)"
+                }
+                return $response
+              } catch {
+                $lastError = $_
+                if ($attempt -lt 3) { Start-Sleep -Seconds (3 * $attempt) }
+              }
+            }
+            throw "发布失败：$($lastError.Exception.Message)"
+          }
+
           $manifest = Get-Content 'site/data/daily-records/manifest.json' -Raw | ConvertFrom-Json
           $predictions = @{}
           foreach ($file in $manifest.records) {
@@ -203,10 +226,52 @@ jobs:
             predictions = $predictions
           } | ConvertTo-Json -Depth 100 -Compress
           $tokenUrl = "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=smart-ledger-v6"
-          $oidc = (Invoke-RestMethod -Uri $tokenUrl -Headers @{ Authorization = "Bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
-          # Both endpoints verify the GitHub OIDC token.  Keep the ledger's
-          # local snapshot current as a fallback when its read from ingress
-          # is temporarily unavailable.
+          $oidc = (Invoke-RestMethod -Uri $tokenUrl -Headers @{ Authorization = "Bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" } -ErrorAction Stop).value
           $headers = @{ Authorization = "Bearer $oidc" }
-          Invoke-RestMethod -Method Post -Uri 'https://v6-sync-ingress-2026.ntr133.chatgpt.site/api/sync/publish' -Headers $headers -ContentType 'application/json' -Body $payload
-          Invoke-RestMethod -Method Post -Uri 'https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/publish' -Headers $headers -ContentType 'application/json' -Body $payload
+
+          Invoke-RequiredPublish -Url 'https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/publish' -Headers $headers -Body $payload | Out-Host
+          $publishedManifest = Invoke-RestMethod -Uri 'https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/manifest' -ErrorAction Stop
+          $expected = @($manifest.records | ForEach-Object { [string]$_ } | Sort-Object { [int]($_ -replace '\.json$', '') } -Descending)
+          $actual = @($publishedManifest.records | ForEach-Object { [string]$_ })
+          foreach ($file in $expected) {
+            if ($actual -notcontains $file) { throw "发布校验失败：缺少 $file" }
+          }
+          $latestFile = $expected | Select-Object -First 1
+          if ($latestFile) {
+            Invoke-RestMethod -Uri "https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/prediction?file=$latestFile" -ErrorAction Stop | Out-Null
+          }
+
+          try {
+            Invoke-RequiredPublish -Url 'https://v6-sync-ingress-2026.ntr133.chatgpt.site/api/sync/publish' -Headers $headers -Body $payload | Out-Host
+          } catch {
+            Write-Warning "外部同步暂时不可用；智能账本已完成本地发布：$($_.Exception.Message)"
+          }
+
+  retry-on-failure:
+    needs: [check-trigger, predict]
+    if: ${{ always() && needs.check-trigger.outputs.should_run == 'true' && needs.predict.result == 'failure' && inputs.retry_attempt != '1' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Queue one guarded retry
+        shell: pwsh
+        run: |
+          $startIssue = '${{ inputs.start_issue }}'
+          if (!$startIssue) { $startIssue = '2026197' }
+          $body = @{
+            ref = '${{ github.ref_name }}'
+            inputs = @{
+              issue = '${{ inputs.issue }}'
+              start_issue = $startIssue
+              force = '${{ inputs.force }}'
+              dry_run = 'false'
+              refresh_data = 'true'
+              retry_attempt = '1'
+            }
+          } | ConvertTo-Json -Compress
+          Invoke-RestMethod -Method Post -Uri 'https://api.github.com/repos/${{ github.repository }}/actions/workflows/run-prediction.yml/dispatches' -Headers @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+          } -ContentType 'application/json' -Body $body -ErrorAction Stop
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
