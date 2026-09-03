@@ -94,10 +94,7 @@ jobs:
             try {
               $tokenUrl = "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=smart-ledger-v6"
               $oidc = (Invoke-RestMethod -Uri $tokenUrl -Headers @{ Authorization = "Bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
-              $headers = @{
-                'OAI-Sites-Authorization' = "Bearer $env:SMART_LEDGER_SIWC_BYPASS_TOKEN"
-                'x-v6-github-oidc' = "Bearer $oidc"
-              }
+              $headers = @{ Authorization = "Bearer $oidc" }
               $response = Invoke-RestMethod -Uri 'https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/request' -Headers $headers
               $shouldRun = [bool]$response.run_requested
             } catch {
@@ -231,13 +228,9 @@ jobs:
           $tokenUrl = "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=smart-ledger-v6"
           $oidc = (Invoke-RestMethod -Uri $tokenUrl -Headers @{ Authorization = "Bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" } -ErrorAction Stop).value
           $headers = @{ Authorization = "Bearer $oidc" }
-          $smartLedgerHeaders = @{
-            'OAI-Sites-Authorization' = "Bearer $env:SMART_LEDGER_SIWC_BYPASS_TOKEN"
-            'x-v6-github-oidc' = "Bearer $oidc"
-          }
 
-          Invoke-RequiredPublish -Url 'https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/publish' -Headers $smartLedgerHeaders -Body $payload | Out-Host
-          $publishedManifest = Invoke-RestMethod -Uri 'https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/manifest' -Headers $smartLedgerHeaders -ErrorAction Stop
+          Invoke-RequiredPublish -Url 'https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/publish' -Headers $headers -Body $payload | Out-Host
+          $publishedManifest = Invoke-RestMethod -Uri 'https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/manifest' -ErrorAction Stop
           $expected = @($manifest.records | ForEach-Object { [string]$_ } | Sort-Object { [int]($_ -replace '\.json$', '') } -Descending)
           $actual = @($publishedManifest.records | ForEach-Object { [string]$_ })
           foreach ($file in $expected) {
@@ -245,7 +238,7 @@ jobs:
           }
           $latestFile = $expected | Select-Object -First 1
           if ($latestFile) {
-            Invoke-RestMethod -Uri "https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/prediction?file=$latestFile" -Headers $smartLedgerHeaders -ErrorAction Stop | Out-Null
+            Invoke-RestMethod -Uri "https://smart-ledger-2026.ntr133.chatgpt.site/api/v6-sync/prediction?file=$latestFile" -ErrorAction Stop | Out-Null
           }
 
           try {
