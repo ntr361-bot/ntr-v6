@@ -78,21 +78,44 @@ public static class SymmetricRuntimeStateSync
             System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(payload.ToString())));
     }
 
+    /// <summary>
+    /// 仅补齐跨版本运行状态中的预测记录，不合并其模型记忆。
+    /// V7 运行状态包含完整的 V6.5/V7 历史预测，但不能当作 V6.5 的学习状态覆盖本机。
+    /// </summary>
+    public static int MergePredictionsIntoLocal(SymmetricRuntimeStateSnapshot incoming)
+    {
+        if (incoming.SchemaVersion != "v1" ||
+            !string.Equals(Hash(incoming), incoming.StateHash, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("跨版本云端预测状态版本或哈希无效");
+        DatabaseHelper.InitializeDatabase();
+        return MergePredictionRows(incoming.Predictions);
+    }
+
     public static int MergeIntoLocal(SymmetricRuntimeStateSnapshot incoming)
     {
         if (incoming.SchemaVersion != "v1" || incoming.ModelVersion != AIEngine.Version ||
             !string.Equals(Hash(incoming), incoming.StateHash, StringComparison.OrdinalIgnoreCase))
             throw new InvalidDataException("云端模型状态版本或哈希无效");
         DatabaseHelper.InitializeDatabase();
-        // 模型记忆是真正会“分叉”的学习状态：本地与云端不一致必须拒绝，防止两套学习互相覆盖。
+        int merged = MergePredictionRows(incoming.Predictions);
         foreach ((string key, string json) in incoming.ModelMemory)
         {
             string? local = DatabaseHelper.LoadModelMemoryJson(key);
-            if (!string.IsNullOrWhiteSpace(local) && !string.Equals(local, json, StringComparison.Ordinal))
-                throw new InvalidDataException($"模型记忆冲突：{key}");
+            if (string.IsNullOrWhiteSpace(local)) DatabaseHelper.SaveModelMemoryJson(key, json);
+            else if (!string.Equals(local, json, StringComparison.Ordinal))
+            {
+                // 本机学习状态已有分叉时，预测快照仍可安全补齐；仅保留本机记忆，
+                // 绝不能用云端状态覆盖它或令整批预测记录同步失败。
+                AppLogger.Info("V6同构状态同步", $"模型记忆冲突，保留本机状态：{key}");
+            }
         }
+        return merged;
+    }
+
+    private static int MergePredictionRows(IReadOnlyList<DatabaseHelper.PredictionRecord> predictions)
+    {
         int merged = 0;
-        foreach (DatabaseHelper.PredictionRecord row in incoming.Predictions)
+        foreach (DatabaseHelper.PredictionRecord row in predictions)
         {
             row.PredictionSource = "云端同步";
             try
@@ -104,11 +127,6 @@ public static class SymmetricRuntimeStateSync
                 // 本地已有首次快照且内容不同（例如每日档案与运行状态来自不同通道）：
                 // 保留本地首次快照，跳过该行，不中断整批同步。
             }
-        }
-        foreach ((string key, string json) in incoming.ModelMemory)
-        {
-            string? local = DatabaseHelper.LoadModelMemoryJson(key);
-            if (string.IsNullOrWhiteSpace(local)) DatabaseHelper.SaveModelMemoryJson(key, json);
         }
         return merged;
     }

@@ -9,12 +9,18 @@ public sealed record CloudSyncResult(
     long LatestPredictionIssue,
     int NewDrawCount,
     int PredictionFileCount,
-    int PredictionRowCount);
+    int PredictionRowCount,
+    string Source = "V6.5 备用云端");
 
 public static class CloudPredictionSyncService
 {
     private const string MachineSyncUrl = "https://v6-sync-ingress-2026.ntr133.chatgpt.site/api/sync/desktop";
-    private static readonly HttpClient Client = CreateClient();
+    private const string GitHubSyncUrl = "https://raw.githubusercontent.com/ntr361-bot/ntr-v6/main/site/data";
+    private const string V7RuntimeStateUrl = "https://raw.githubusercontent.com/ntr361-bot/ntr-v7/main/site/data/runtime-state.json";
+    private static readonly HttpClient Client = CreateClient(useProxy: true);
+    private static readonly HttpClient DirectClient = CreateClient(useProxy: false);
+    private static readonly CloudSyncSource GitHubSource = new("GitHub V6.5 正式数据", CreateGitHubSyncRequest);
+    private static readonly CloudSyncSource FallbackSource = new("V6.5 备用云端", CreateMachineSyncRequest);
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -26,8 +32,21 @@ public static class CloudPredictionSyncService
 
     public static async Task<CloudSyncResult> SyncAsync(CancellationToken cancellationToken = default)
     {
-        int newDraws = await SyncHistoryAsync(cancellationToken);
+        CloudSyncSource source = GitHubSource;
+        CloudHistoryArchive history;
+        try
+        {
+            history = await DownloadAsync<CloudHistoryArchive>(source, "history", cancellationToken);
+        }
+        catch (Exception githubError) when (CanUseFallback(githubError, cancellationToken))
+        {
+            AppLogger.Info("V6云端档案同步", $"GitHub 正式档案不可用，改用备用云端：{githubError.Message}");
+            source = FallbackSource;
+            history = await DownloadAsync<CloudHistoryArchive>(source, "history", cancellationToken);
+        }
+        int newDraws = ImportHistoryArchive(history);
         CloudManifest manifest = await DownloadAsync<CloudManifest>(
+            source,
             "manifest",
             cancellationToken);
         if (manifest.Status != "success" || manifest.Records.Count == 0)
@@ -35,6 +54,7 @@ public static class CloudPredictionSyncService
 
         int files = 0;
         int rows = 0;
+        long latestPredictionIssue = manifest.LatestIssue;
         foreach (string fileName in manifest.Records)
         {
             if (!IsSafePredictionFile(fileName))
@@ -44,6 +64,7 @@ public static class CloudPredictionSyncService
             try
             {
                 prediction = await DownloadAsync<CloudDailyPrediction>(
+                    source,
                     $"prediction?file={Uri.EscapeDataString(fileName)}",
                     cancellationToken);
                 AtomicWrite(localFile, prediction);
@@ -78,8 +99,11 @@ public static class CloudPredictionSyncService
         try
         {
             SymmetricRuntimeStateSnapshot runtimeState = await DownloadAsync<SymmetricRuntimeStateSnapshot>(
+                source,
                 "runtime-state", cancellationToken);
             int merged = SymmetricRuntimeStateSync.MergeIntoLocal(runtimeState);
+            rows += merged;
+            latestPredictionIssue = Math.Max(latestPredictionIssue, LatestIssue(runtimeState.Predictions));
             AppLogger.Info("V6同构状态同步", $"已合并云端运行状态，补齐预测记录 {merged} 条，状态哈希 {runtimeState.StateHash}");
         }
         catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -87,9 +111,27 @@ public static class CloudPredictionSyncService
             AppLogger.Info("V6同构状态同步", "云端尚未发布同构运行状态，保留现有开奖与预测档案同步");
         }
 
+        // V7 正式运行状态包含完整的 V6.5/V7 预测历史；V6.5 仓库的每日清单
+        // 可能滞后，只补齐预测记录，不合并 V7 的学习记忆。
+        try
+        {
+            SymmetricRuntimeStateSnapshot v7RuntimeState = await DownloadAsync<SymmetricRuntimeStateSnapshot>(
+                new CloudSyncSource("GitHub V7 预测补齐", CreateV7RuntimeStateRequest),
+                "runtime-state", cancellationToken);
+            int supplemented = SymmetricRuntimeStateSync.MergePredictionsIntoLocal(v7RuntimeState);
+            rows += supplemented;
+            latestPredictionIssue = Math.Max(latestPredictionIssue, LatestIssue(v7RuntimeState.Predictions));
+            AppLogger.Info("V6跨版本预测补齐", $"从 V7 正式运行状态补齐预测记录 {supplemented} 条，最新预测期号 {LatestIssue(v7RuntimeState.Predictions)}");
+        }
+        catch (Exception supplementalError) when (!cancellationToken.IsCancellationRequested)
+        {
+            // 补充源不可用时不影响 V6 主同步；下次同步继续尝试。
+            AppLogger.Info("V6跨版本预测补齐", $"V7 补充状态暂不可用，保留主同步结果：{supplementalError.Message}");
+        }
+
         DatabaseHelper.BatchVerifyAIPredicts();
-        return new CloudSyncResult(DatabaseHelper.GetLatestPeriod(), manifest.LatestIssue,
-            newDraws, files, rows);
+        return new CloudSyncResult(DatabaseHelper.GetLatestPeriod(), latestPredictionIssue,
+            newDraws, files, rows, source.Name);
     }
 
     public static int ImportPrediction(CloudDailyPrediction prediction)
@@ -172,14 +214,10 @@ public static class CloudPredictionSyncService
     {
         if (prediction.Status != "success" || prediction.Issue <= 0 || prediction.AiZodiac.Count == 0)
             return false;
-        return prediction.AiZodiac.Values.All(IsCompleteModelSnapshot);
-    }
-
-    private static async Task<int> SyncHistoryAsync(CancellationToken cancellationToken)
-    {
-        CloudHistoryArchive archive = await DownloadAsync<CloudHistoryArchive>(
-            "history", cancellationToken);
-        return ImportHistoryArchive(archive);
+        // A daily file may include optional experimental models that publish
+        // only summaries. Import the complete model rows and skip those extras;
+        // requiring every model to be complete rejects the entire issue.
+        return prediction.AiZodiac.Values.Any(IsCompleteModelSnapshot);
     }
 
     /// <summary>
@@ -250,10 +288,49 @@ public static class CloudPredictionSyncService
         return request;
     }
 
-    private static async Task<T> DownloadAsync<T>(string resource, CancellationToken cancellationToken)
+    public static HttpRequestMessage CreateGitHubSyncRequest(string resource)
     {
-        using HttpRequestMessage request = CreateMachineSyncRequest(resource);
-        using HttpResponseMessage response = await Client.SendAsync(request, cancellationToken);
+        string relativePath = resource switch
+        {
+            "history" => "history.json",
+            "manifest" => "daily-records/manifest.json",
+            "runtime-state" => "runtime-state.json",
+            _ when resource.StartsWith("prediction?file=", StringComparison.Ordinal) =>
+                $"daily-records/{GetSafePredictionFileName(resource)}",
+            _ => throw new ArgumentException("GitHub 云端同步资源无效", nameof(resource))
+        };
+        return new HttpRequestMessage(HttpMethod.Get, $"{GitHubSyncUrl}/{relativePath}");
+    }
+
+    private static HttpRequestMessage CreateV7RuntimeStateRequest(string resource)
+    {
+        if (!string.Equals(resource, "runtime-state", StringComparison.Ordinal))
+            throw new ArgumentException("V7 云端补充资源无效", nameof(resource));
+        return new HttpRequestMessage(HttpMethod.Get, V7RuntimeStateUrl);
+    }
+
+    private static long LatestIssue(IEnumerable<DatabaseHelper.PredictionRecord> predictions) =>
+        predictions.Select(row => long.TryParse(row.Issue, out long issue) ? issue : 0)
+            .DefaultIfEmpty(0)
+            .Max();
+
+    private static string GetSafePredictionFileName(string resource)
+    {
+        const string prefix = "prediction?file=";
+        string fileName = Uri.UnescapeDataString(resource[prefix.Length..]);
+        if (!IsSafePredictionFile(fileName))
+            throw new ArgumentException("GitHub 云端预测文件名无效", nameof(resource));
+        return fileName;
+    }
+
+    private static bool CanUseFallback(Exception error, CancellationToken cancellationToken) =>
+        !cancellationToken.IsCancellationRequested && error is HttpRequestException or JsonException or InvalidDataException;
+
+    private static async Task<T> DownloadAsync<T>(CloudSyncSource source, string resource, CancellationToken cancellationToken)
+    {
+        using HttpRequestMessage request = source.CreateRequest(resource);
+        HttpClient client = ReferenceEquals(source, FallbackSource) ? DirectClient : Client;
+        using HttpResponseMessage response = await client.SendAsync(request, cancellationToken);
         if (response.StatusCode == HttpStatusCode.NotFound)
             throw new HttpRequestException("云端同步文件尚未发布", null, response.StatusCode);
         if (!response.IsSuccessStatusCode)
@@ -287,18 +364,16 @@ public static class CloudPredictionSyncService
         long.TryParse(Path.GetFileNameWithoutExtension(value), out long issue) && issue > 0 &&
         Path.GetFileName(value) == value;
 
-    private static HttpClient CreateClient()
+    private static HttpClient CreateClient(bool useProxy)
     {
-        var handler = new HttpClientHandler
-        {
-            // The local proxy fails TLS negotiation with the cloud host.
-            UseProxy = false
-        };
+        var handler = new HttpClientHandler { UseProxy = useProxy };
         var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
         client.DefaultRequestHeaders.UserAgent.ParseAdd(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36");
         return client;
     }
+
+    private sealed record CloudSyncSource(string Name, Func<string, HttpRequestMessage> CreateRequest);
 }
 
 public sealed class CloudManifest
