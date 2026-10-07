@@ -1,0 +1,58 @@
+name: Sync isolated forum observations
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'forum-observations/requests/**'
+      - 'scripts/forum-observations/**'
+      - 'tests/forum-observations/**'
+      - '.github/workflows/forum-observation-sync.yml'
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'Existing frozen request issue; never generates predictions'
+        type: string
+        required: true
+      operation:
+        description: 'Submit exact committed file'
+        type: choice
+        options: [freeze, settle]
+        required: true
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: forum-observation-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    if: github.repository == 'ntr361-bot/ntr-v6' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test isolated submitter
+        run: node --test tests/forum-observations/*.test.mjs
+      - name: Submit only requested files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          REQUEST_ISSUE: ${{ inputs.issue }}
+          REQUEST_OPERATION: ${{ inputs.operation }}
+          SITES_SIWC_BYPASS_TOKEN: ${{ secrets.SITES_SIWC_BYPASS_TOKEN }}
+        run: node scripts/forum-observations/queue.mjs
+      - name: Preserve requests and delivery results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forum-sync-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            forum-observations/requests/
+            forum-sync-results/
+          if-no-files-found: ignore
+          retention-days: 90
