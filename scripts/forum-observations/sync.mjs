@@ -63,7 +63,14 @@ export async function probe({ env = process.env, fetcher = fetch } = {}) {
   // No real or example prediction is submitted and no observation can be inserted.
   const response = await fetcher(`${SITE}/api/forum-observations/freeze`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(30000), redirect: 'error' });
   const result = await response.json().catch(() => ({}));
-  check(response.status === 400 && typeof result.error === 'string' && /issue/i.test(result.error), `Forum OIDC probe failed: HTTP ${response.status}`);
+  const accepted = response.status === 400 && typeof result.error === 'string' && /issue/i.test(result.error);
+  const diagnostic = { httpStatus: response.status, oidcIssued: true, siteAccessSecretConfigured: Boolean(env.SITES_SIWC_BYPASS_TOKEN), layer: accepted ? 'authenticated-validation' : result.error === 'Unauthorized forum sync' ? 'ledger-oidc-verification' : 'site-access-or-unrecognized-response' };
+  if (!accepted) {
+    // Log only known classifications, never raw responses, payloads or tokens.
+    console.error(JSON.stringify(diagnostic));
+    if (env.GITHUB_STEP_SUMMARY) await writeFile(env.GITHUB_STEP_SUMMARY, `Forum auth blocked: HTTP ${diagnostic.httpStatus}; ${diagnostic.layer}; OIDC issued; site access secret configured: ${diagnostic.siteAccessSecretConfigured}. No observation submitted.\n`, { flag: 'a' });
+  }
+  check(accepted, `Forum OIDC probe failed: HTTP ${response.status}; ${diagnostic.layer}`);
   console.log('Legal ntr-v6 main OIDC accepted; empty payload rejected (HTTP400); no observation written.');
 }
 export async function submit(operation, body, meta, { env = process.env, fetcher = fetch } = {}) {
