@@ -38,6 +38,10 @@ jobs:
           node-version: '22'
       - name: Test isolated submitter
         run: node --test tests/forum-observations/*.test.mjs
+      - name: Check legal OIDC without inserting an observation
+        env:
+          SITES_SIWC_BYPASS_TOKEN: ${{ secrets.SITES_SIWC_BYPASS_TOKEN }}
+        run: node scripts/forum-observations/sync.mjs check-auth
       - name: Submit only requested files
         env:
           EVENT_NAME: ${{ github.event_name }}

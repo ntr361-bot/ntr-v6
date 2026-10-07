@@ -43,8 +43,7 @@ export function validate(operation, body, meta) {
   check(typeof meta.reportPath === 'string' && new RegExp(`^forum-observations/requests/${p.issue}/report\\.md$`).test(meta.reportPath), 'Matching report path missing');
   return p;
 }
-export async function submit(operation, body, meta, { env = process.env, fetcher = fetch } = {}) {
-  const payload = validate(operation, body, meta);
+export async function authorization({ env = process.env, fetcher = fetch } = {}) {
   check(env.GITHUB_REPOSITORY === 'ntr361-bot/ntr-v6' && env.GITHUB_REF === 'refs/heads/main', 'Only ntr-v6 main may submit');
   check(env.ACTIONS_ID_TOKEN_REQUEST_URL && env.ACTIONS_ID_TOKEN_REQUEST_TOKEN, 'Legal GitHub Actions OIDC unavailable; frozen report remains unsynced');
   const url = new URL(env.ACTIONS_ID_TOKEN_REQUEST_URL);
@@ -56,6 +55,20 @@ export async function submit(operation, body, meta, { env = process.env, fetcher
   check(typeof token === 'string' && token.length > 0, 'OIDC token missing');
   const headers = { 'Content-Type': 'application/json', 'X-V6-GitHub-OIDC': `Bearer ${token}` };
   if (env.SITES_SIWC_BYPASS_TOKEN) headers['OAI-Sites-Authorization'] = `Bearer ${env.SITES_SIWC_BYPASS_TOKEN}`;
+  return headers;
+}
+export async function probe({ env = process.env, fetcher = fetch } = {}) {
+  const headers = await authorization({ env, fetcher });
+  // Intentionally invalid: the server checks OIDC before rejecting the issue.
+  // No real or example prediction is submitted and no observation can be inserted.
+  const response = await fetcher(`${SITE}/api/forum-observations/freeze`, { method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(30000), redirect: 'error' });
+  const result = await response.json().catch(() => ({}));
+  check(response.status === 400 && typeof result.error === 'string' && /issue/i.test(result.error), `Forum OIDC probe failed: HTTP ${response.status}`);
+  console.log('Legal ntr-v6 main OIDC accepted; empty payload rejected (HTTP400); no observation written.');
+}
+export async function submit(operation, body, meta, { env = process.env, fetcher = fetch } = {}) {
+  const payload = validate(operation, body, meta);
+  const headers = await authorization({ env, fetcher });
   let response;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -85,4 +98,7 @@ export async function run(operation, issue) {
   if (process.env.GITHUB_STEP_SUMMARY) await writeFile(process.env.GITHUB_STEP_SUMMARY, `${issue} ${operation}: ${receipt.error ?? `HTTP ${receipt.httpStatus}; ledger accepted`}\nSHA256: ${receipt.sha256}\n`, { flag: 'a' });
   check(!receipt.error, receipt.error);
 }
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await run(...process.argv.slice(2));
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (process.argv[2] === 'check-auth') await probe();
+  else await run(...process.argv.slice(2));
+}

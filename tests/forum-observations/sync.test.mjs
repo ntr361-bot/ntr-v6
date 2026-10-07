@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { validate, submit, digest } from '../../scripts/forum-observations/sync.mjs';
+import { validate, submit, digest, probe } from '../../scripts/forum-observations/sync.mjs';
 
 const env = { GITHUB_REPOSITORY: 'ntr361-bot/ntr-v6', GITHUB_REF: 'refs/heads/main', ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.githubusercontent.com/token?test=1', ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'runner-secret' };
 function fixture() {
@@ -32,3 +32,4 @@ test('401 never retries or uses an alternative identity',async()=>{let writes=0;
 test('server failure retries the same bytes and preserves successful receipt',async()=>{const body='{"issue":2026281,"actualZodiac":"鼠"}';let writes=0;const result=await submit('settle',body,undefined,{env,fetcher:async(url,o)=>{if(url instanceof URL)return {ok:true,json:async()=>({value:'oidc'})};assert.equal(o.body,body);writes++;return {ok:writes===3,status:writes===3?200:503};}});assert.equal(writes,3);assert.equal(result.operation,'settle');});
 test('settle cannot contain ranking or author updates',()=>{assert.throws(()=>validate('settle','{"issue":2026281,"actualZodiac":"鼠","fullRanking":[]}',undefined));});
 test('workflow has no model generation/deployment or prediction table paths',async()=>{const text=await readFile('.github/workflows/forum-observation-sync.yml','utf8');assert.match(text,/id-token: write/);assert.doesNotMatch(text,/dotnet|PredictionRunner|v6-sync\/publish|v7-sync|P25|pages: write|contents: write/);});
+test('auth probe requires server validation rejection and sends no observation',async()=>{let writes=0;await probe({env,fetcher:async(url,o)=>{if(url instanceof URL)return {ok:true,json:async()=>({value:'oidc'})};assert.equal(o.body,'{}');writes++;return {status:400,json:async()=>({error:'issue must be >= 2026280'})};}});assert.equal(writes,1);await assert.rejects(probe({env,fetcher:async(url)=>url instanceof URL?{ok:true,json:async()=>({value:'oidc'})}:{status:401,json:async()=>({error:'Unauthorized'})}}),/HTTP 401/);});
